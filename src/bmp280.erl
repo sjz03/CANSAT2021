@@ -1,7 +1,23 @@
+%%
+%% 
+%% 
 
 -module(bmp280).
 
 -include("bmp280.hrl").
+
+-export([
+    start_link/2,
+    sample/1,
+    set_sea_level_pressure/2,
+    set_current_height/2,
+
+    init/1,
+    handle_call/3,
+    handle_cast/2,
+    handle_info/2,
+    terminate/2
+]).
 
 -export([
     open/2,
@@ -20,20 +36,86 @@
     measurement_from_raw_sample/2
 ]).
 
--record(bmp280_calib, {
-    dig_t1,
-    dig_t2,
-    dig_t3,
-    dig_p1,
-    dig_p2,
-    dig_p3,
-    dig_p4,
-    dig_p5,
-    dig_p6,
-    dig_p7,
-    dig_p8,
-    dig_p9
+-record(state, {
+    ref,
+    mode = normal,              % sleep | forced | normal
+    sea_level_pressure = 10000, % hPa
+    calibration_data
 }).
+
+-record(calibration_data, {
+    dig_t1, dig_t2, dig_t3,
+    dig_p1, dig_p2, dig_p3, dig_p4, dig_p5, dig_p6, dig_p7, dig_p8, dig_p9
+}).
+
+% @doc
+start_link(Bus, Address) ->
+    gen_server:start_link(?MODULE, [Bus, Address], []).
+
+set_sea_level_pressure(Pid, Level) ->
+    gen_server:call(Pid, {set_sea_level_pressure, Level}).
+
+set_current_height(Pid, Height) ->
+    gen_server:call(Pid, {set_current_height, Height}).
+
+sample(Pid) ->
+    gen_server:call(Pid, sample).
+
+stop() ->
+    ok.
+
+
+%%
+%% Gen server callbacks
+%% 
+
+init([Bus, Address]) ->
+    {ok, Ref} = open(Bus, Address),
+
+    %% Check the id of the chip
+    case id(Ref) of
+        16#58 ->
+            %% Do a complete chip reset.
+            ok = reset(Ref),
+
+            %% Set the chip in normal sampling mode
+            ok = setopt(Ref),
+
+            %% Get the calibration data
+            {ok, RawCalibrationData} = read_calibration(Ref),
+            CalibrationData = calibration(RawCalibrationData),
+ 
+            {ok, #state{ref = Ref, mode = normal, calibration_data=CalibrationData}};
+        _ ->
+            {stop, wrong_chip}
+    end.
+
+handle_call(sample, _From, #state{ref=Ref,
+                                  sea_level_pressure=SeaLevelPressure,
+                                  calibration_data=CalibrationData}=State) ->
+    Sample = sample(Ref, CalibrationData, SeaLevelPressure),
+    {reply, {ok, Sample}, State};
+handle_call({set_sea_level_pressure, Pressure}, _From, State) ->
+    {reply, ok, State#state{sea_level_pressure=Pressure}};
+handle_call({set_current_height, Height}, _From, #state{ref=Ref,
+                                                        sea_level_pressure=SeaLevelPressure,
+                                                        calibration_data=CalibrationData}=State) ->
+    Sample = sample(Ref, CalibrationData, SeaLevelPressure),
+    Pressure = maps:get(pressure, Sample),
+    SeaLevelPressure1 = calc:sea_level_pressure(Pressure, Height),
+    {reply, ok, State#state{sea_level_pressure=SeaLevelPressure1}};
+handle_call(_Req, _From, State) ->
+    {stop, unknown_call, lState}.
+
+handle_cast(_Request, State) ->
+    {noreply, State}.
+
+handle_info(_Info, State) ->
+    {noreply, State}.
+
+terminate(_Reason, State) ->
+    %% Close the connection
+    ok.
 
 
 %%
@@ -94,26 +176,37 @@ read_calibration(Ref) ->
 read_raw_sample(Ref) ->
     read(Ref, ?BMP280_PRESS_MSB, 6).
 
+sample(Ref, CalibrationData, SeaLevelPressure) ->
+    Timestamp = erlang:system_time(millisecond),
+    {ok, RawSample} = read_raw_sample(Ref),
+    Sample = measurement_from_raw_sample(RawSample, CalibrationData),
+    Height = calc:pressure_to_altitude(maps:get(pressure, Sample), SeaLevelPressure),
+    Sample#{ timestamp => Timestamp, height => Height}.
+
 measurement_from_raw_sample(RawSample, Calibration) ->
     <<RawPressure:20, _:4, RawTemperature:20, _:4>> = RawSample,
     Temperature = raw_to_temperature(RawTemperature, Calibration),
     Pressure = raw_to_pressure(RawPressure, Temperature, Calibration),
 
-    #{ temperature => Temperature,
-       pressure => Pressure
-     }.
+    #{ 
+        temperature => maps:get(temperature, Temperature),
+        pressure => Pressure
+    }.
 
-raw_to_temperature(RawTemp, #bmp280_calib{dig_t1=T1, dig_t2=T2, dig_t3=T3}) ->
+raw_to_temperature(RawTemp, #calibration_data{dig_t1=T1, dig_t2=T2, dig_t3=T3}) ->
     Var1 = (RawTemp / 16384 - T1 / 1024) * T2,
     Var2 = (RawTemp / 131072 - T1 / 8192) * (RawTemp / 131072 - T1 / 8192) * T3,
-    (Var1 + Var2) / 5120.
+    TFine = (Var1 + Var2),
 
-raw_to_pressure(RawPressure, Temperature,
-                #bmp280_calib{dig_p1=P1, dig_p2=P2, dig_p3=P3,
-                              dig_p4=P4, dig_p5=P5, dig_p6=P6,
-                              dig_p7=P7, dig_p8=P8, dig_p9=P9}) ->
-    TFine = Temperature * 5120,
+    #{ 
+        t_fine => TFine,
+        temperature => TFine / 5120
+    }.
 
+raw_to_pressure(RawPressure, #{ t_fine := TFine },
+                #calibration_data{dig_p1=P1, dig_p2=P2, dig_p3=P3,
+                                  dig_p4=P4, dig_p5=P5, dig_p6=P6,
+                                  dig_p7=P7, dig_p8=P8, dig_p9=P9}) ->
     V1 = TFine / 2 - 64000,
 
     V2 = V1 * V1 * P6 / 32768,
@@ -139,7 +232,7 @@ calibration(Data) ->
       P4:16/little-signed, P5:16/little-signed, P6:16/little-signed, 
       P7:16/little-signed, P8:16/little-signed, P9:16/little-signed>> = Data,
 
-      #bmp280_calib{
+      #calibration_data{
           dig_t1=T1, dig_t2=T2, dig_t3=T3,
           dig_p1=P1, dig_p2=P2, dig_p3=P3,
           dig_p4=P4, dig_p5=P5, dig_p6=P6,
