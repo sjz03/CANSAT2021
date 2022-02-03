@@ -1,4 +1,4 @@
--module(hello_erlang_supervisor).
+-module(cansat_mission_supervisor).
 
 -behaviour(supervisor).
 
@@ -10,7 +10,7 @@ start_link(Options) ->
 
 init(_Options) ->
     Flags = {one_for_one, 1000, 3600},
-    Specs = [{hello_erlang_worker,
-	      {hello_erlang_worker, start_link, []}, permanent, 2000,
-	      worker, [hello_erlang_worker]}],
+    Specs = [{cansat_mission_worker,
+	      {cansat_mission_worker, start_link, []}, permanent, 2000,
+	      worker, [cansat_mission_worker]}],
     {ok, {Flags, Specs}}.

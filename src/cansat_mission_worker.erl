@@ -1,4 +1,4 @@
--module(hello_erlang_worker).
+-module(cansat_mission_worker).
 
 -behaviour(gen_server).
 

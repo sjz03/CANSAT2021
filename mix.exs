@@ -1,7 +1,7 @@
 defmodule HelloErlang.MixProject do
   use Mix.Project
 
-  @app :hello_erlang
+  @app :cansat_mission
   @version "0.1.0"
   @all_targets [:rpi, :rpi0, :rpi2, :rpi3, :rpi3a, :rpi4, :bbb, :osd32mp1, :x86_64]
 
@@ -22,8 +22,8 @@ defmodule HelloErlang.MixProject do
   # Run "mix help compile.app" to learn about applications.
   def application do
     [
-      mod: {:hello_erlang_app, []},
-      extra_applications: [:logger, :runtime_tools]
+      mod: {:cansat_mission_app, []},
+      extra_applications: [:logger, :runtime_tools, :circuits_gpio, :circuits_i2c]
     ]
   end
 

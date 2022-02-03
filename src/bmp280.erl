@@ -9,8 +9,11 @@
 -export([
     start_link/2,
     sample/1,
+    start_sampling/2,
+    get_samples/1,
     set_sea_level_pressure/2,
     set_current_height/2,
+    reset/1,
 
     init/1,
     handle_call/3,
@@ -19,28 +22,17 @@
     terminate/2
 ]).
 
--export([
-    open/2,
-    write/3,
-    read/3,
-
-    id/1,
-    status/1,
-    reset/1,
-    setopt/1, setopt/2,
-
-    read_calibration/1,
-    calibration/1,
-
-    read_raw_sample/1,
-    measurement_from_raw_sample/2
-]).
 
 -record(state, {
     ref,
     mode = normal,              % sleep | forced | normal
     sea_level_pressure = 10000, % hPa
-    calibration_data
+    calibration_data,
+
+    % Sample collection
+    is_sampling = false,
+    stop_sampling_time,
+    samples = []
 }).
 
 -record(calibration_data, {
@@ -52,6 +44,9 @@
 start_link(Bus, Address) ->
     gen_server:start_link(?MODULE, [Bus, Address], []).
 
+reset(Pid) ->
+    gen_server:call(Pid, reset).
+
 set_sea_level_pressure(Pid, Level) ->
     gen_server:call(Pid, {set_sea_level_pressure, Level}).
 
@@ -60,6 +55,12 @@ set_current_height(Pid, Height) ->
 
 sample(Pid) ->
     gen_server:call(Pid, sample).
+
+start_sampling(Pid, Seconds) ->
+    gen_server:call(Pid, {start_sampling, Seconds}).
+
+get_samples(Pid) ->
+    gen_server:call(Pid, get_samples).
 
 stop() ->
     ok.
@@ -76,7 +77,10 @@ init([Bus, Address]) ->
     case id(Ref) of
         16#58 ->
             %% Do a complete chip reset.
-            ok = reset(Ref),
+            ok = raw_reset(Ref),
+
+            %% Give the chip 2ms to wake up.
+            timer:sleep(2),
 
             %% Set the chip in normal sampling mode
             ok = setopt(Ref),
@@ -90,17 +94,34 @@ init([Bus, Address]) ->
             {stop, wrong_chip}
     end.
 
-handle_call(sample, _From, #state{ref=Ref,
-                                  sea_level_pressure=SeaLevelPressure,
-                                  calibration_data=CalibrationData}=State) ->
-    Sample = sample(Ref, CalibrationData, SeaLevelPressure),
+handle_call(reset, _From, #state{ref=Ref}=State) ->
+    %% Do a complete chip reset.
+    ok = raw_reset(Ref),
+
+    %% Set the chip in normal sampling mode
+    ok = setopt(Ref),
+
+    {reply, ok, State#state{sea_level_pressure=10000}};
+
+handle_call({start_sampling, _Seconds}, _From, #state{is_sampling=true}=State) ->
+    {reply, {error, already_sampling}, State};
+handle_call({start_sampling, Seconds}, _From, #state{is_sampling=false}=State) ->
+    self() ! sample,
+    StopSamplingTime = erlang:system_time(millisecond) + Seconds * 1000,
+    {reply, ok, State#state{samples=[], stop_sampling_time=StopSamplingTime, is_sampling=true}};
+
+handle_call(get_samples, _From, #state{samples=Samples}=State) ->
+    {reply, {ok, Samples}, State};
+
+handle_call(sample, _From, State) ->
+    Sample = do_sample(State),
     {reply, {ok, Sample}, State};
+
+
 handle_call({set_sea_level_pressure, Pressure}, _From, State) ->
     {reply, ok, State#state{sea_level_pressure=Pressure}};
-handle_call({set_current_height, Height}, _From, #state{ref=Ref,
-                                                        sea_level_pressure=SeaLevelPressure,
-                                                        calibration_data=CalibrationData}=State) ->
-    Sample = sample(Ref, CalibrationData, SeaLevelPressure),
+handle_call({set_current_height, Height}, _From, State) ->
+    Sample = do_sample(State),
     Pressure = maps:get(pressure, Sample),
     SeaLevelPressure1 = calc:sea_level_pressure(Pressure, Height),
     {reply, ok, State#state{sea_level_pressure=SeaLevelPressure1}};
@@ -109,6 +130,18 @@ handle_call(_Req, _From, State) ->
 
 handle_cast(_Request, State) ->
     {noreply, State}.
+
+handle_info(sample, #state{samples=Samples}=State) ->
+    Sample = do_sample(State),
+    Samples1 = [Sample|Samples],
+
+    case maps:get(timestamp, Sample) of
+        Ts when Ts > State#state.stop_sampling_time ->
+            {noreply, State#state{is_sampling=false, stop_sampling_time=undefined, samples=Samples1}};
+        _ ->
+            erlang:send_after(1000, self(), sample),
+            {noreply, State#state{samples=Samples1}}
+    end;
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -152,7 +185,7 @@ status(Ref) ->
     }.
 
 % @doc Do a complete reset power on of the bmp280
-reset(Ref) ->
+raw_reset(Ref) ->
     ok = write(Ref, ?BMP280_RESET, 16#B6).
 
 setopt(Ref) ->
@@ -176,7 +209,11 @@ read_calibration(Ref) ->
 read_raw_sample(Ref) ->
     read(Ref, ?BMP280_PRESS_MSB, 6).
 
-sample(Ref, CalibrationData, SeaLevelPressure) ->
+
+do_sample(#state{ref=Ref, sea_level_pressure=SeaLevelPressure, calibration_data=CalibrationData}) ->
+    do_sample(Ref, CalibrationData, SeaLevelPressure).
+
+do_sample(Ref, CalibrationData, SeaLevelPressure) ->
     Timestamp = erlang:system_time(millisecond),
     {ok, RawSample} = read_raw_sample(Ref),
     Sample = measurement_from_raw_sample(RawSample, CalibrationData),

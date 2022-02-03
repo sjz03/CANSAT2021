@@ -1,4 +1,4 @@
--module(hello_erlang_app).
+-module(cansat_mission_app).
 
 -behaviour(application).
 
